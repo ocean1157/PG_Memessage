@@ -143,12 +143,14 @@ public class PgBugMailTracker extends JFrame {
 
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.setAutoCreateRowSorter(true);
-        table.getColumnModel().getColumn(0).setPreferredWidth(85);
-        table.getColumnModel().getColumn(1).setPreferredWidth(150);
-        table.getColumnModel().getColumn(2).setPreferredWidth(430);
-        table.getColumnModel().getColumn(3).setPreferredWidth(90);
+        table.getColumnModel().getColumn(0).setPreferredWidth(48);
+        table.getColumnModel().getColumn(0).setMaxWidth(58);
+        table.getColumnModel().getColumn(1).setPreferredWidth(85);
+        table.getColumnModel().getColumn(2).setPreferredWidth(150);
+        table.getColumnModel().getColumn(3).setPreferredWidth(430);
         table.getColumnModel().getColumn(4).setPreferredWidth(90);
-        table.getColumnModel().getColumn(5).setPreferredWidth(130);
+        table.getColumnModel().getColumn(5).setPreferredWidth(90);
+        table.getColumnModel().getColumn(6).setPreferredWidth(130);
         JScrollPane listPane = new JScrollPane(table);
 
         JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, listPane, buildDetailPanel());
@@ -447,35 +449,54 @@ public class PgBugMailTracker extends JFrame {
     }
 
     private void deleteSelectedRecord() {
-        if (selected == null) {
-            statusLabel.setText("请先选择要删除的邮件记录");
+        List<BugRecord> checked = tableModel.checkedRecords();
+        final List<BugRecord> recordsToDelete = checked.isEmpty()
+                ? (selected == null ? Collections.<BugRecord>emptyList() : Collections.singletonList(selected))
+                : checked;
+        if (recordsToDelete.isEmpty()) {
+            statusLabel.setText("请先勾选或选择要删除的邮件记录");
             return;
         }
-        final BugRecord record = selected;
-        String label = record.bugId.trim().isEmpty() ? record.subject : record.bugId + " " + record.subject;
+        String label = deleteSummary(recordsToDelete);
         int result = JOptionPane.showConfirmDialog(this,
-                "确定删除这条本地记录吗？\n\n" + label + "\n\n只会删除本地 data/records.tsv 中的记录，不会影响 PostgreSQL 官方邮件归档。",
+                "确定删除 " + recordsToDelete.size() + " 条本地记录吗？\n\n" + label
+                        + "\n\n只会删除本地 data/records.tsv 中的记录，不会影响 PostgreSQL 官方邮件归档。",
                 "删除邮件记录",
                 JOptionPane.YES_NO_OPTION,
                 JOptionPane.WARNING_MESSAGE);
         if (result != JOptionPane.YES_OPTION) return;
 
         int viewRow = table.getSelectedRow();
-        if (tableModel.removeRecord(record)) {
+        boolean selectedDeleted = selected != null && recordsToDelete.contains(selected);
+        int removed = tableModel.removeRecords(recordsToDelete);
+        if (removed > 0) {
             try {
                 store.save(tableModel.allRecords());
-                statusLabel.setText("已删除本地记录：" + (label.trim().isEmpty() ? "未命名邮件" : label));
+                statusLabel.setText("已删除 " + removed + " 条本地记录");
             } catch (IOException e) {
                 showError("删除后保存失败", e);
             }
         }
 
-        if (table.getRowCount() > 0) {
+        if (selectedDeleted && table.getRowCount() > 0) {
             int next = Math.min(Math.max(viewRow, 0), table.getRowCount() - 1);
             table.setRowSelectionInterval(next, next);
-        } else {
+        } else if (table.getRowCount() == 0) {
             clearDetail();
         }
+    }
+
+    private String deleteSummary(List<BugRecord> records) {
+        StringBuilder sb = new StringBuilder();
+        int limit = Math.min(records.size(), 8);
+        for (int i = 0; i < limit; i++) {
+            BugRecord r = records.get(i);
+            String name = r.bugId.trim().isEmpty() ? r.subject : r.bugId + " " + r.subject;
+            if (name.trim().isEmpty()) name = "未命名邮件";
+            sb.append(i + 1).append(". ").append(name).append('\n');
+        }
+        if (records.size() > limit) sb.append("... 另有 ").append(records.size() - limit).append(" 条\n");
+        return sb.toString().trim();
     }
 
     private void translateSelected() {
@@ -708,10 +729,18 @@ class ConversationRenderer {
         if (!message.cc.isEmpty()) html.append("<br>抄送: ").append(escape(message.cc));
         if (!message.subject.isEmpty()) html.append("<br>主题: ").append(escape(message.subject));
         html.append("</div>");
-        html.append("<div style='font-family:Microsoft YaHei,Segoe UI,Consolas,monospace;font-size:12px;");
-        html.append("line-height:1.45;margin-top:8px;color:#1f2937;'>");
-        html.append(bodyHtml(message.body, message.summaryOnly));
-        html.append("</div>");
+        if (message.body == null || message.body.trim().isEmpty()) {
+            if (message.summaryOnly) {
+                html.append("<div style='font-size:11px;color:#98a2b3;margin-top:8px;'>正文未抓取，仅显示线程索引信息。</div>");
+            } else {
+                html.append("<div style='font-size:11px;color:#98a2b3;margin-top:8px;'>这封邮件没有可显示的正文。</div>");
+            }
+        } else {
+            html.append("<div style='font-family:Microsoft YaHei,Segoe UI,Consolas,monospace;font-size:12px;");
+            html.append("line-height:1.45;margin-top:8px;color:#1f2937;'>");
+            html.append(bodyHtml(message.body, false));
+            html.append("</div>");
+        }
         html.append("</td></tr></table>");
         html.append("</td></tr></table>");
     }
@@ -1402,6 +1431,7 @@ class ProfessionalTranslator {
 }
 
 class BugRecord {
+    boolean checked;
     String bugId = "";
     String messageId = "";
     String subject = "";
@@ -1422,7 +1452,7 @@ class BugRecord {
 }
 
 class BugTableModel extends AbstractTableModel {
-    private final String[] columns = {"Bug 编号", "日期", "主题", "PG 版本", "状态", "严重级别"};
+    private final String[] columns = {"选择", "Bug 编号", "日期", "主题", "PG 版本", "状态", "严重级别"};
     private final List<BugRecord> all = new ArrayList<BugRecord>();
     private final List<BugRecord> shown = new ArrayList<BugRecord>();
     private String filter = "";
@@ -1525,20 +1555,38 @@ class BugTableModel extends AbstractTableModel {
         return new ArrayList<BugRecord>(all);
     }
 
+    public List<BugRecord> checkedRecords() {
+        List<BugRecord> records = new ArrayList<BugRecord>();
+        for (BugRecord r : all) {
+            if (r.checked) records.add(r);
+        }
+        return records;
+    }
+
     public boolean removeRecord(BugRecord record) {
-        boolean removed = all.remove(record);
-        if (!removed) {
-            String recordKey = key(record);
-            Iterator<BugRecord> iterator = all.iterator();
-            while (iterator.hasNext()) {
-                if (key(iterator.next()).equals(recordKey)) {
-                    iterator.remove();
-                    removed = true;
-                    break;
-                }
+        return removeRecords(Collections.singletonList(record)) > 0;
+    }
+
+    public int removeRecords(Collection<BugRecord> records) {
+        if (records == null || records.isEmpty()) return 0;
+        Set<BugRecord> identities = Collections.newSetFromMap(new IdentityHashMap<BugRecord, Boolean>());
+        Set<String> keys = new HashSet<String>();
+        for (BugRecord record : records) {
+            if (record == null) continue;
+            identities.add(record);
+            keys.add(key(record));
+        }
+
+        int removed = 0;
+        Iterator<BugRecord> iterator = all.iterator();
+        while (iterator.hasNext()) {
+            BugRecord current = iterator.next();
+            if (identities.contains(current) || keys.contains(key(current))) {
+                iterator.remove();
+                removed++;
             }
         }
-        if (removed) applyFilter();
+        if (removed > 0) applyFilter();
         return removed;
     }
 
@@ -1546,15 +1594,27 @@ class BugTableModel extends AbstractTableModel {
     @Override public int getRowCount() { return shown.size(); }
     @Override public int getColumnCount() { return columns.length; }
     @Override public String getColumnName(int column) { return columns[column]; }
+    @Override public Class<?> getColumnClass(int columnIndex) {
+        return columnIndex == 0 ? Boolean.class : String.class;
+    }
+    @Override public boolean isCellEditable(int rowIndex, int columnIndex) {
+        return columnIndex == 0;
+    }
+    @Override public void setValueAt(Object value, int rowIndex, int columnIndex) {
+        if (columnIndex != 0 || rowIndex < 0 || rowIndex >= shown.size()) return;
+        shown.get(rowIndex).checked = Boolean.TRUE.equals(value);
+        fireTableCellUpdated(rowIndex, columnIndex);
+    }
     @Override public Object getValueAt(int rowIndex, int columnIndex) {
         BugRecord r = shown.get(rowIndex);
         switch (columnIndex) {
-            case 0: return r.bugId;
-            case 1: return r.date;
-            case 2: return r.subject;
-            case 3: return r.pgVersion;
-            case 4: return r.status;
-            case 5: return r.severity;
+            case 0: return r.checked;
+            case 1: return r.bugId;
+            case 2: return r.date;
+            case 3: return r.subject;
+            case 4: return r.pgVersion;
+            case 5: return r.status;
+            case 6: return r.severity;
             default: return "";
         }
     }
