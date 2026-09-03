@@ -7,5 +7,5 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-start "PG Bug Mail Tracker" javaw -cp out PgBugMailTracker
+java -cp out PgBugMailTracker
 endlocal

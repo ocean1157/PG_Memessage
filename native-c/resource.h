@@ -1,0 +1,13 @@
+#define IDI_APP_ICON 101
+#define IDC_FETCH 201
+#define IDC_SAVE 202
+#define IDC_EXPORT 203
+#define IDC_LIST 204
+#define IDC_BUG_ID 205
+#define IDC_SUBJECT 206
+#define IDC_VERSION 207
+#define IDC_ERROR 208
+#define IDC_REPRO 209
+#define IDC_RESOLUTION 210
+#define IDC_VERIFY 211
+#define IDC_STATUS 212

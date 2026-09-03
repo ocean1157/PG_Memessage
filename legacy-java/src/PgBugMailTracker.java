@@ -11,12 +11,15 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.script.ScriptEngine;
+import javax.script.ScriptEngineManager;
 
 public class PgBugMailTracker extends JFrame {
     private final File storeFile = new File("data/records.tsv");
@@ -24,11 +27,13 @@ public class PgBugMailTracker extends JFrame {
     private final RecordStore store = new RecordStore(storeFile);
     private final BugTableModel tableModel = new BugTableModel();
     private final JTable table = new JTable(tableModel);
+    private final JTabbedPane detailTabs = new JTabbedPane();
     private final JTextField filterField = new JTextField();
     private final JSpinner yearSpinner = new JSpinner(new SpinnerNumberModel(Calendar.getInstance().get(Calendar.YEAR), 1997, 2100, 1));
     private final JSpinner monthSpinner = new JSpinner(new SpinnerNumberModel(Calendar.getInstance().get(Calendar.MONTH) + 1, 1, 12, 1));
     private final JSpinner monthsSpinner = new JSpinner(new SpinnerNumberModel(1, 1, 36, 1));
     private final JSpinner limitSpinner = new JSpinner(new SpinnerNumberModel(120, 1, 1000, 10));
+    private final JComboBox<TranslationLanguage> translationTarget = new JComboBox<TranslationLanguage>(ProfessionalTranslator.languages());
     private final JLabel statusLabel = new JLabel("就绪");
 
     private final JTextField bugIdField = readOnlyField();
@@ -45,7 +50,9 @@ public class PgBugMailTracker extends JFrame {
     private final JTextArea reproArea = area(8);
     private final JTextArea stepsArea = area(7);
     private final JTextArea notesArea = area(5);
-    private final JTextArea rawArea = area(10);
+    private final JEditorPane conversationPane = conversationPane();
+    private final JTextArea translationArea = readOnlyArea(10);
+    private final JTextArea rawArea = readOnlyArea(10);
 
     private BugRecord selected;
     private boolean loadingRecord;
@@ -175,6 +182,19 @@ public class PgBugMailTracker extends JFrame {
             @Override public void actionPerformed(ActionEvent e) { openSelectedUrl(); }
         });
         bar.add(open, c);
+        addLabel(bar, c, "翻译为");
+        translationTarget.setToolTipText("源语言自动识别，只翻译自然语言描述，代码和专业标识尽量保留");
+        bar.add(translationTarget, c);
+        JButton translate = new JButton("翻译原文");
+        translate.addActionListener(new ActionListener() {
+            @Override public void actionPerformed(ActionEvent e) { translateSelected(); }
+        });
+        bar.add(translate, c);
+        JButton delete = new JButton("删除记录");
+        delete.addActionListener(new ActionListener() {
+            @Override public void actionPerformed(ActionEvent e) { deleteSelectedRecord(); }
+        });
+        bar.add(delete, c);
         JButton save = new JButton("保存");
         save.addActionListener(new ActionListener() {
             @Override public void actionPerformed(ActionEvent e) { saveAll(); }
@@ -194,10 +214,11 @@ public class PgBugMailTracker extends JFrame {
 
     private JComponent buildDetailPanel() {
         JPanel panel = new JPanel(new BorderLayout(8, 8));
-        JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("邮件信息", buildFormPanel());
-        tabs.addTab("原文", new JScrollPane(rawArea));
-        panel.add(tabs, BorderLayout.CENTER);
+        detailTabs.addTab("邮件信息", buildFormPanel());
+        detailTabs.addTab("对话原文", new JScrollPane(conversationPane));
+        detailTabs.addTab("翻译结果", new JScrollPane(translationArea));
+        detailTabs.addTab("纯文本原文", new JScrollPane(rawArea));
+        panel.add(detailTabs, BorderLayout.CENTER);
         return panel;
     }
 
@@ -389,6 +410,10 @@ public class PgBugMailTracker extends JFrame {
         reproArea.setText(r.reproCode);
         stepsArea.setText(r.diagnosticSteps);
         notesArea.setText(r.notes);
+        conversationPane.setText(ConversationRenderer.render(r));
+        conversationPane.setCaretPosition(0);
+        translationArea.setText("点击顶部“翻译原文”后，这里会显示中文翻译。\n\n代码、SQL、路径、日志、错误码和 PostgreSQL 专业术语会尽量保留原文。");
+        translationArea.setCaretPosition(0);
         rawArea.setText(r.rawText);
         rawArea.setCaretPosition(0);
         loadingRecord = false;
@@ -419,6 +444,101 @@ public class PgBugMailTracker extends JFrame {
         } catch (IOException e) {
             showError("保存失败", e);
         }
+    }
+
+    private void deleteSelectedRecord() {
+        if (selected == null) {
+            statusLabel.setText("请先选择要删除的邮件记录");
+            return;
+        }
+        final BugRecord record = selected;
+        String label = record.bugId.trim().isEmpty() ? record.subject : record.bugId + " " + record.subject;
+        int result = JOptionPane.showConfirmDialog(this,
+                "确定删除这条本地记录吗？\n\n" + label + "\n\n只会删除本地 data/records.tsv 中的记录，不会影响 PostgreSQL 官方邮件归档。",
+                "删除邮件记录",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+        if (result != JOptionPane.YES_OPTION) return;
+
+        int viewRow = table.getSelectedRow();
+        if (tableModel.removeRecord(record)) {
+            try {
+                store.save(tableModel.allRecords());
+                statusLabel.setText("已删除本地记录：" + (label.trim().isEmpty() ? "未命名邮件" : label));
+            } catch (IOException e) {
+                showError("删除后保存失败", e);
+            }
+        }
+
+        if (table.getRowCount() > 0) {
+            int next = Math.min(Math.max(viewRow, 0), table.getRowCount() - 1);
+            table.setRowSelectionInterval(next, next);
+        } else {
+            clearDetail();
+        }
+    }
+
+    private void translateSelected() {
+        if (selected == null) {
+            statusLabel.setText("请先选择要翻译的邮件记录");
+            return;
+        }
+        final BugRecord record = selected;
+        final TranslationLanguage target = (TranslationLanguage) translationTarget.getSelectedItem();
+        final String source = ConversationRenderer.translationSource(record);
+        if (source.trim().isEmpty()) {
+            translationArea.setText("当前记录没有可翻译的邮件文本。");
+            detailTabs.setSelectedIndex(2);
+            return;
+        }
+
+        translationArea.setText("正在翻译为 " + target.name + "，请稍候...\n\n会保留代码、SQL、路径、日志、错误码和 PostgreSQL 专业术语。");
+        translationArea.setCaretPosition(0);
+        detailTabs.setSelectedIndex(2);
+        statusLabel.setText("正在翻译原文为 " + target.name + "...");
+
+        SwingWorker<String, Void> worker = new SwingWorker<String, Void>() {
+            @Override protected String doInBackground() throws Exception {
+                return ProfessionalTranslator.translate(source, target);
+            }
+
+            @Override protected void done() {
+                try {
+                    translationArea.setText(get());
+                    translationArea.setCaretPosition(0);
+                    statusLabel.setText("翻译完成：" + target.name);
+                } catch (Exception e) {
+                    translationArea.setText("翻译失败：\n" + e.getMessage()
+                            + "\n\n建议稍后重试，或检查当前网络是否可以访问在线翻译接口。");
+                    translationArea.setCaretPosition(0);
+                    statusLabel.setText("翻译失败");
+                }
+            }
+        };
+        worker.execute();
+    }
+
+    private void clearDetail() {
+        loadingRecord = true;
+        selected = null;
+        bugIdField.setText("");
+        subjectField.setText("");
+        dateField.setText("");
+        fromField.setText("");
+        messageIdField.setText("");
+        urlField.setText("");
+        versionField.setText("");
+        statusField.setText("未分析");
+        severityField.setText("");
+        tagsField.setText("");
+        errorArea.setText("");
+        reproArea.setText("");
+        stepsArea.setText("");
+        notesArea.setText("");
+        conversationPane.setText(ConversationRenderer.render(new BugRecord()));
+        translationArea.setText("");
+        rawArea.setText("");
+        loadingRecord = false;
     }
 
     private void exportCsv() {
@@ -461,6 +581,23 @@ public class PgBugMailTracker extends JFrame {
         return a;
     }
 
+    private static JTextArea readOnlyArea(int rows) {
+        JTextArea a = area(rows);
+        a.setEditable(false);
+        a.setBackground(UIManager.getColor("TextField.inactiveBackground"));
+        return a;
+    }
+
+    private static JEditorPane conversationPane() {
+        JEditorPane pane = new JEditorPane();
+        pane.setContentType("text/html");
+        pane.setEditable(false);
+        pane.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
+        pane.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+        pane.setBackground(new Color(245, 247, 250));
+        return pane;
+    }
+
     private static String two(int value) {
         return value < 10 ? "0" + value : String.valueOf(value);
     }
@@ -483,6 +620,784 @@ public class PgBugMailTracker extends JFrame {
         private final JTextArea area;
         TextAreaLike(JTextArea area) { this.area = area; }
         @Override public void addDocumentListener(DocumentListener listener) { area.getDocument().addDocumentListener(listener); }
+    }
+}
+
+class ConversationRenderer {
+    private static final Pattern JOINED_MAIL = Pattern.compile("(?m)^-----\\s+关联邮件:\\s*(.*?)\\s+-----\\s*$");
+    private static final Pattern THREAD_LINE = Pattern.compile("^(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+from\\s+(.+?)\\s*$");
+    private static final String ATTACHMENT_MARK = new String(Character.toChars(0x1F4CE));
+    private static final Set<String> HEADER_LABELS = new HashSet<String>(Arrays.asList(
+            "From", "To", "Cc", "Subject", "Date", "Message-ID", "Views", "Thread", "Lists"
+    ));
+
+    static String render(BugRecord record) {
+        List<MailMessage> messages = buildMessages(record);
+        String reporterKey = reporterKey(messages, record);
+        String title = cleanOneLine((record.bugId + " " + record.subject).trim());
+        if (title.isEmpty()) title = "未命名邮件";
+
+        StringBuilder html = new StringBuilder();
+        html.append("<html><body style='font-family:Microsoft YaHei,Segoe UI,sans-serif;font-size:12px;");
+        html.append("background-color:#f5f7fa;color:#1f2937;margin:0;padding:12px;'>");
+        html.append("<table width='100%' cellpadding='0' cellspacing='0'><tr><td>");
+        html.append("<div style='font-size:16px;font-weight:bold;color:#111827;margin-bottom:4px;'>")
+                .append(escape(title)).append("</div>");
+        html.append("<div style='color:#667085;margin-bottom:12px;'>");
+        html.append("邮件往返 ").append(messages.size()).append(" 封");
+        if (!record.status.trim().isEmpty()) html.append(" · 状态 ").append(escape(record.status.trim()));
+        if (!record.pgVersion.trim().isEmpty()) html.append(" · PG ").append(escape(record.pgVersion.trim()));
+        html.append("</div>");
+
+        if (messages.isEmpty()) {
+            html.append(emptyMessage(record.rawText));
+        } else {
+            for (MailMessage message : messages) {
+                appendBubble(html, message, reporterKey);
+            }
+        }
+
+        html.append("</td></tr></table></body></html>");
+        return html.toString();
+    }
+
+    static String translationSource(BugRecord record) {
+        List<MailMessage> messages = buildMessages(record);
+        StringBuilder text = new StringBuilder();
+        for (MailMessage message : messages) {
+            String body = compactBody(message.body);
+            if (body.isEmpty() && message.summaryOnly) continue;
+            text.append("Time: ").append(message.date).append('\n');
+            text.append("From: ").append(message.from).append('\n');
+            if (!message.to.isEmpty()) text.append("To: ").append(message.to).append('\n');
+            if (!message.cc.isEmpty()) text.append("Cc: ").append(message.cc).append('\n');
+            if (!message.subject.isEmpty()) text.append("Subject: ").append(message.subject).append('\n');
+            if (message.hasAttachment) text.append("Attachment: yes\n");
+            text.append("Content:\n");
+            text.append(body).append("\n\n");
+        }
+        if (text.length() == 0 && record.rawText != null) {
+            text.append(extractBody(record.rawText));
+        }
+        return text.toString().trim();
+    }
+
+    private static void appendBubble(StringBuilder html, MailMessage message, String reporterKey) {
+        String identity = identity(message.from);
+        boolean reporterSide = !reporterKey.isEmpty() && reporterKey.equals(identity);
+        if (message.from.toLowerCase(Locale.ROOT).contains("pg bug reporting form")) reporterSide = true;
+        String align = reporterSide ? "left" : "right";
+        String bg = reporterSide ? "#ffffff" : "#d9fdd3";
+        String border = reporterSide ? "#d0d7de" : "#9bd88f";
+        String role = reporterSide ? "来信 / 问题报告" : "社区回复";
+
+        html.append("<table width='100%' cellpadding='0' cellspacing='0' style='margin:8px 0 12px 0;'>");
+        html.append("<tr><td align='").append(align).append("'>");
+        html.append("<table width='82%' cellpadding='8' cellspacing='0' bgcolor='").append(bg).append("' ");
+        html.append("style='border:1px solid ").append(border).append(";border-radius:8px;'>");
+        html.append("<tr><td>");
+        html.append("<div style='font-size:13px;font-weight:bold;color:#101828;'>")
+                .append(escape(displayName(message.from)));
+        html.append(" <span style='font-weight:normal;color:#667085;'>").append(escape(role)).append("</span>");
+        if (message.hasAttachment) html.append(" <span style='color:#b54708;'>附件</span>");
+        html.append("</div>");
+        html.append("<div style='font-size:11px;color:#667085;margin-top:2px;'>");
+        if (!message.date.isEmpty()) html.append(escape(message.date));
+        if (!message.from.isEmpty()) html.append("<br>发件人: ").append(escape(message.from));
+        if (!message.to.isEmpty()) html.append("<br>收件人: ").append(escape(message.to));
+        if (!message.cc.isEmpty()) html.append("<br>抄送: ").append(escape(message.cc));
+        if (!message.subject.isEmpty()) html.append("<br>主题: ").append(escape(message.subject));
+        html.append("</div>");
+        html.append("<div style='font-family:Microsoft YaHei,Segoe UI,Consolas,monospace;font-size:12px;");
+        html.append("line-height:1.45;margin-top:8px;color:#1f2937;'>");
+        html.append(bodyHtml(message.body, message.summaryOnly));
+        html.append("</div>");
+        html.append("</td></tr></table>");
+        html.append("</td></tr></table>");
+    }
+
+    private static String emptyMessage(String rawText) {
+        String text = rawText == null || rawText.trim().isEmpty()
+                ? "当前记录没有邮件原文。"
+                : rawText.trim();
+        return "<table width='100%' cellpadding='10' cellspacing='0' bgcolor='#ffffff' "
+                + "style='border:1px solid #d0d7de;'><tr><td>"
+                + bodyHtml(limit(text, 4000), false)
+                + "</td></tr></table>";
+    }
+
+    private static List<MailMessage> buildMessages(BugRecord record) {
+        List<MailMessage> thread = parseThread(record.rawText);
+        List<MailMessage> bodies = parseBodyBlocks(record.rawText);
+        LinkedHashMap<String, MailMessage> merged = new LinkedHashMap<String, MailMessage>();
+
+        for (MailMessage message : thread) {
+            merged.put(looseKey(message), message);
+        }
+        for (MailMessage body : bodies) {
+            String key = looseKey(body);
+            MailMessage existing = merged.get(key);
+            if (existing == null) {
+                merged.put(key, body);
+            } else {
+                existing.merge(body);
+            }
+        }
+
+        List<MailMessage> result = new ArrayList<MailMessage>(merged.values());
+        if (result.isEmpty() && record.rawText != null && !record.rawText.trim().isEmpty()) {
+            MailMessage fallback = new MailMessage();
+            fallback.from = record.from;
+            fallback.date = record.date;
+            fallback.subject = record.subject;
+            fallback.messageId = record.messageId;
+            fallback.body = extractBody(record.rawText);
+            result.add(fallback);
+        }
+
+        Collections.sort(result, new Comparator<MailMessage>() {
+            @Override public int compare(MailMessage a, MailMessage b) {
+                return a.date.compareTo(b.date);
+            }
+        });
+        return result;
+    }
+
+    private static List<MailMessage> parseBodyBlocks(String rawText) {
+        List<MailBlock> blocks = splitBlocks(rawText);
+        List<MailMessage> messages = new ArrayList<MailMessage>();
+        for (MailBlock block : blocks) {
+            MailMessage message = parseBodyBlock(block.text);
+            applySeparatorHints(message, block.title);
+            if (!message.date.isEmpty() || !message.from.isEmpty() || !message.body.isEmpty()) {
+                messages.add(message);
+            }
+        }
+        return messages;
+    }
+
+    private static List<MailBlock> splitBlocks(String rawText) {
+        List<MailBlock> blocks = new ArrayList<MailBlock>();
+        if (rawText == null || rawText.trim().isEmpty()) return blocks;
+        Matcher matcher = JOINED_MAIL.matcher(rawText);
+        int start = 0;
+        String title = "";
+        while (matcher.find()) {
+            addBlock(blocks, title, rawText.substring(start, matcher.start()));
+            title = matcher.group(1);
+            start = matcher.end();
+        }
+        addBlock(blocks, title, rawText.substring(start));
+        return blocks;
+    }
+
+    private static void addBlock(List<MailBlock> blocks, String title, String text) {
+        String trimmed = text == null ? "" : text.trim();
+        if (!trimmed.isEmpty()) blocks.add(new MailBlock(title == null ? "" : title.trim(), trimmed));
+    }
+
+    private static MailMessage parseBodyBlock(String block) {
+        MailMessage message = new MailMessage();
+        message.from = headerValue(block, "From");
+        message.to = headerValue(block, "To");
+        message.cc = headerValue(block, "Cc");
+        message.subject = headerValue(block, "Subject");
+        message.date = headerValue(block, "Date");
+        message.messageId = headerValue(block, "Message-ID");
+        message.body = extractBody(block);
+        message.hasAttachment = block.contains(ATTACHMENT_MARK)
+                || block.toLowerCase(Locale.ROOT).contains("attachment");
+        return message;
+    }
+
+    private static void applySeparatorHints(MailMessage message, String title) {
+        if (title == null || title.trim().isEmpty()) return;
+        Matcher matcher = Pattern.compile("^(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(.+?)\\s+([^\\s]+@[^\\s]+)$").matcher(title.trim());
+        if (matcher.find()) {
+            if (message.date.isEmpty()) message.date = matcher.group(1).trim();
+            if (message.from.isEmpty()) message.from = matcher.group(2).trim();
+            if (message.messageId.isEmpty()) message.messageId = matcher.group(3).trim();
+        }
+    }
+
+    private static List<MailMessage> parseThread(String rawText) {
+        List<MailMessage> messages = new ArrayList<MailMessage>();
+        if (rawText == null || rawText.trim().isEmpty()) return messages;
+        String[] lines = normalizeLines(rawText);
+        int start = -1;
+        for (int i = 0; i < lines.length; i++) {
+            if ("Thread:".equalsIgnoreCase(lines[i].trim())) {
+                start = i + 1;
+                break;
+            }
+        }
+        if (start < 0) return messages;
+        for (int i = start; i < lines.length; i++) {
+            String line = lines[i].trim();
+            if (line.isEmpty()) continue;
+            if ("Lists:".equalsIgnoreCase(line) || isArchiveStop(line)) break;
+            Matcher matcher = THREAD_LINE.matcher(line);
+            if (!matcher.find()) {
+                if (!messages.isEmpty()) break;
+                continue;
+            }
+            String sender = matcher.group(2).replace(ATTACHMENT_MARK, "").trim();
+            MailMessage message = new MailMessage();
+            message.date = matcher.group(1).trim();
+            message.from = sender;
+            message.summaryOnly = true;
+            message.hasAttachment = line.contains(ATTACHMENT_MARK);
+            messages.add(message);
+        }
+        return messages;
+    }
+
+    private static String extractBody(String block) {
+        String[] lines = normalizeLines(block);
+        int start = bodyStart(lines);
+        StringBuilder body = new StringBuilder();
+        boolean seenContent = false;
+        for (int i = start; i < lines.length; i++) {
+            String trimmed = lines[i].trim();
+            if (isArchiveStop(trimmed)) break;
+            if (isQuoteLine(trimmed) || isQuoteBoundary(trimmed)) {
+                if (seenContent) break;
+                continue;
+            }
+            if (body.length() == 0 && isLeadingNoise(trimmed)) continue;
+            body.append(lines[i]).append('\n');
+            if (!trimmed.isEmpty()) seenContent = true;
+        }
+        return compactBody(body.toString());
+    }
+
+    private static int bodyStart(String[] lines) {
+        for (int i = 0; i < lines.length; i++) {
+            if ("Lists:".equalsIgnoreCase(lines[i].trim())) {
+                int j = i + 1;
+                while (j < lines.length) {
+                    String t = lines[j].trim();
+                    if (!t.isEmpty() && !t.matches("pgsql-[A-Za-z0-9_-]+")) break;
+                    j++;
+                }
+                return j;
+            }
+        }
+        for (int i = 0; i < lines.length; i++) {
+            if ("Thread:".equalsIgnoreCase(lines[i].trim())) {
+                int j = i + 1;
+                while (j < lines.length) {
+                    String t = lines[j].trim();
+                    if (t.isEmpty() || THREAD_LINE.matcher(t).find()) {
+                        j++;
+                        continue;
+                    }
+                    break;
+                }
+                return j;
+            }
+        }
+        return 0;
+    }
+
+    private static String[] normalizeLines(String text) {
+        return (text == null ? "" : text.replace("\r\n", "\n").replace('\r', '\n')).split("\\n", -1);
+    }
+
+    private static String headerValue(String block, String label) {
+        String[] lines = normalizeLines(block);
+        String prefix = label + ":";
+        StringBuilder value = new StringBuilder();
+        boolean capture = false;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (!capture) {
+                if (trimmed.equalsIgnoreCase(label) || trimmed.equalsIgnoreCase(prefix)) {
+                    capture = true;
+                    continue;
+                }
+                if (trimmed.regionMatches(true, 0, prefix, 0, prefix.length())) {
+                    capture = true;
+                    String rest = trimmed.substring(prefix.length()).trim();
+                    if (!rest.isEmpty()) value.append(rest);
+                    continue;
+                }
+            } else {
+                if (isKnownHeader(trimmed) || isArchiveStop(trimmed)) break;
+                if (!trimmed.isEmpty()) {
+                    if (value.length() > 0) value.append(' ');
+                    value.append(trimmed);
+                }
+            }
+        }
+        return cleanOneLine(value.toString());
+    }
+
+    private static boolean isKnownHeader(String line) {
+        if (line == null || line.trim().isEmpty()) return false;
+        String t = line.trim();
+        for (String label : HEADER_LABELS) {
+            if (t.equalsIgnoreCase(label) || t.equalsIgnoreCase(label + ":")) return true;
+            if (t.regionMatches(true, 0, label + ":", 0, label.length() + 1)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isLeadingNoise(String line) {
+        return line.equals("Home")
+                || line.equals("About")
+                || line.equals("Download")
+                || line.equals("Documentation")
+                || line.equals("Community")
+                || line.equals("Developers")
+                || line.equals("Support")
+                || line.equals("Donate")
+                || line.equals("Your account")
+                || line.equals("Quick Links")
+                || line.equals("Contributors")
+                || line.equals("Mailing Lists")
+                || line.equals("IRC")
+                || line.equals("Local User Groups")
+                || line.equals("Events")
+                || line.equals("International Sites");
+    }
+
+    private static boolean isArchiveStop(String line) {
+        if (line == null || line.isEmpty()) return false;
+        return line.equals("In response to")
+                || line.equals("Responses")
+                || line.startsWith("Browse pgsql-")
+                || line.equals("Previous Message")
+                || line.equals("Next Message")
+                || line.startsWith("Privacy Policy")
+                || line.startsWith("Code of Conduct")
+                || line.startsWith("About PostgreSQL")
+                || line.equals("Contact")
+                || line.startsWith("Copyright ");
+    }
+
+    private static boolean isQuoteLine(String line) {
+        return line != null && line.trim().startsWith(">");
+    }
+
+    private static boolean isQuoteBoundary(String line) {
+        if (line == null || line.trim().isEmpty()) return false;
+        String t = line.trim();
+        return t.matches("(?i)^on .+ wrote:$")
+                || t.matches("(?i)^.*<[^>]+> wrote:$")
+                || t.matches("(?i)^-+\\s*(original|forwarded) message\\s*-+")
+                || t.matches("(?i)^in response to\\b.*")
+                || t.matches("(?i)^responses\\b.*");
+    }
+
+    private static String bodyHtml(String body, boolean summaryOnly) {
+        String text = body == null ? "" : body.trim();
+        if (text.isEmpty()) {
+            text = summaryOnly ? "这封只在邮件 Thread 索引里出现，本地还没有抓到正文。" : "这封邮件没有可显示的正文。";
+        }
+        text = compactBody(text);
+        StringBuilder html = new StringBuilder();
+        String[] lines = normalizeLines(text);
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (isQuoteLine(trimmed) || isQuoteBoundary(trimmed)) break;
+            String visible = preserveLeadingSpaces(line);
+            if (trimmed.startsWith(">")) {
+                html.append("<span style='color:#667085;'>").append(visible).append("</span><br>");
+            } else if (trimmed.matches("(?i)^on .+ wrote:$")) {
+                html.append("<span style='color:#667085;font-weight:bold;'>").append(visible).append("</span><br>");
+            } else {
+                html.append(visible).append("<br>");
+            }
+        }
+        return html.toString();
+    }
+
+    private static String preserveLeadingSpaces(String line) {
+        int count = 0;
+        while (count < line.length() && line.charAt(count) == ' ' && count < 16) count++;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < count; i++) sb.append("&nbsp;");
+        sb.append(escape(line.substring(count)));
+        return sb.toString();
+    }
+
+    private static String compactBody(String body) {
+        String text = body == null ? "" : body.replace("\r\n", "\n").replace('\r', '\n');
+        text = text.replaceAll("(?m)[ \\t]+$", "");
+        text = text.replaceAll("\\n{4,}", "\n\n\n");
+        return text.trim();
+    }
+
+    private static String reporterKey(List<MailMessage> messages, BugRecord record) {
+        for (MailMessage message : messages) {
+            String sender = message.from.toLowerCase(Locale.ROOT);
+            if (sender.contains("pg bug reporting form") || sender.contains("noreply")) continue;
+            String key = identity(message.from);
+            if (!key.isEmpty()) return key;
+        }
+        String recordKey = identity(record.from);
+        if (!recordKey.isEmpty()) return recordKey;
+        return messages.isEmpty() ? "" : identity(messages.get(0).from);
+    }
+
+    private static String looseKey(MailMessage message) {
+        String identity = identity(message.from);
+        if (!message.date.isEmpty() || !identity.isEmpty()) return message.date + "|" + identity;
+        return "msg:" + message.messageId;
+    }
+
+    private static String identity(String sender) {
+        String email = email(sender).toLowerCase(Locale.ROOT);
+        if (!email.isEmpty()) return email;
+        return displayName(sender).toLowerCase(Locale.ROOT);
+    }
+
+    private static String displayName(String sender) {
+        String s = cleanOneLine(sender);
+        int lt = s.indexOf('<');
+        if (lt > 0) s = s.substring(0, lt).trim();
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() > 1) s = s.substring(1, s.length() - 1);
+        return s.isEmpty() ? "未知发件人" : s;
+    }
+
+    private static String email(String sender) {
+        Matcher matcher = Pattern.compile("<([^>]+)>").matcher(sender == null ? "" : sender);
+        return matcher.find() ? cleanOneLine(matcher.group(1)) : "";
+    }
+
+    private static String cleanOneLine(String value) {
+        return value == null ? "" : value.replace('\r', ' ').replace('\n', ' ').replaceAll("\\s+", " ").trim();
+    }
+
+    private static String limit(String value, int max) {
+        if (value == null || value.length() <= max) return value == null ? "" : value;
+        return value.substring(0, max) + "\n\n...";
+    }
+
+    private static String escape(String value) {
+        if (value == null) return "";
+        StringBuilder out = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '&': out.append("&amp;"); break;
+                case '<': out.append("&lt;"); break;
+                case '>': out.append("&gt;"); break;
+                case '"': out.append("&quot;"); break;
+                case '\'': out.append("&#39;"); break;
+                default: out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    private static class MailBlock {
+        final String title;
+        final String text;
+        MailBlock(String title, String text) {
+            this.title = title;
+            this.text = text;
+        }
+    }
+
+    private static class MailMessage {
+        String date = "";
+        String from = "";
+        String to = "";
+        String cc = "";
+        String subject = "";
+        String messageId = "";
+        String body = "";
+        boolean hasAttachment;
+        boolean summaryOnly;
+
+        void merge(MailMessage other) {
+            if (other == null) return;
+            if (from.isEmpty()) from = other.from;
+            if (to.isEmpty()) to = other.to;
+            if (cc.isEmpty()) cc = other.cc;
+            if (subject.isEmpty()) subject = other.subject;
+            if (messageId.isEmpty()) messageId = other.messageId;
+            if (body.isEmpty() && !other.body.isEmpty()) {
+                body = other.body;
+                summaryOnly = false;
+            }
+            hasAttachment = hasAttachment || other.hasAttachment;
+        }
+    }
+}
+
+class TranslationLanguage {
+    final String name;
+    final String code;
+
+    TranslationLanguage(String name, String code) {
+        this.name = name;
+        this.code = code;
+    }
+
+    @Override public String toString() {
+        return name;
+    }
+}
+
+class ProfessionalTranslator {
+    private static final Pattern SQL_START = Pattern.compile(
+            "(?i)^\\s*(?:[-*]\\s*)?(?:postgres(?:=#|=>)\\s*)?(CREATE|SELECT|INSERT|UPDATE|DELETE|ALTER|DROP|WITH|BEGIN|COMMIT|ROLLBACK|EXPLAIN|LOAD|SET|RESET|COPY|VACUUM|ANALYZE|TRUNCATE|PREPARE|EXECUTE|DO|CALL)\\b.*");
+    private static final Pattern LOG_LINE = Pattern.compile(
+            "(?i)^\\s*(ERROR|FATAL|PANIC|WARNING|NOTICE|DETAIL|HINT|CONTEXT|LOCATION|STATEMENT):\\s+.*");
+    private static final Pattern PROTECTED_TOKEN = Pattern.compile(
+            "`[^`]+`"
+                    + "|https?://\\S+"
+                    + "|[A-Za-z]:\\\\\\S+"
+                    + "|/\\S+"
+                    + "|<[^>]+>"
+                    + "|#[0-9]+"
+                    + "|\\b[A-Za-z0-9._%+-]+(?:@|\\(at\\))[A-Za-z0-9._%+()\\-]+\\b"
+                    + "|\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*\\(\\)"
+                    + "|\\b[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+\\b"
+                    + "|\\b(?:PostgreSQL|Postgres|SQL|DDL|DML|DCL|TCL|WAL|LSN|MVCC|VACUUM|ANALYZE|GIN|GiST|SP-GiST|BRIN|B-tree|hash index|planner|executor|optimizer|parser|rewriter|backpatch|buildfarm|snapshot|serializable|relation|tuple|page|buffer|buffer lock|checkpoint|autovacuum|replication|logical replication|physical replication|standby|primary|failover|timeline|extension|fdw|opclass|collation|ICU|OID|TOAST|NULL|SQLSTATE|SIGSEGV|core dump|backtrace|pg_basebackup|pg_dump|pg_restore|pg_upgrade|psql|initdb|pgbench|pgsql-bugs|pgsql-hackers|odbc_fdw|byteaout|float8out|ERROR|FATAL|PANIC|WARNING|NOTICE|HINT|DETAIL|CONTEXT)\\b",
+            Pattern.CASE_INSENSITIVE);
+
+    static TranslationLanguage[] languages() {
+        return new TranslationLanguage[] {
+                new TranslationLanguage("中文（简体）", "zh-CN"),
+                new TranslationLanguage("English", "en"),
+                new TranslationLanguage("日本語", "ja"),
+                new TranslationLanguage("한국어", "ko"),
+                new TranslationLanguage("Français", "fr"),
+                new TranslationLanguage("Deutsch", "de"),
+                new TranslationLanguage("Español", "es"),
+                new TranslationLanguage("Русский", "ru"),
+                new TranslationLanguage("Português", "pt"),
+                new TranslationLanguage("Tiếng Việt", "vi")
+        };
+    }
+
+    static String translate(String source, TranslationLanguage target) throws IOException {
+        if (target == null) target = languages()[0];
+        StringBuilder out = new StringBuilder();
+        out.append("目标语言: ").append(target.name).append('\n');
+        out.append("说明: SQL、代码、路径、日志、错误码、函数名和 PostgreSQL 专业术语会尽量保留原文。\n\n");
+
+        String[] lines = normalizeLines(source);
+        StringBuilder paragraph = new StringBuilder();
+        for (String line : lines) {
+            if (line.trim().isEmpty()) {
+                flushParagraph(out, paragraph, target);
+                out.append('\n');
+            } else if (isCodeLikeLine(line)) {
+                flushParagraph(out, paragraph, target);
+                out.append(line).append('\n');
+            } else {
+                if (paragraph.length() > 0) paragraph.append('\n');
+                paragraph.append(line);
+            }
+        }
+        flushParagraph(out, paragraph, target);
+        return out.toString().replaceAll("\\n{4,}", "\n\n\n").trim();
+    }
+
+    private static void flushParagraph(StringBuilder out, StringBuilder paragraph, TranslationLanguage target) throws IOException {
+        String text = paragraph.toString().trim();
+        paragraph.setLength(0);
+        if (text.isEmpty()) return;
+
+        ProtectedText protectedText = protectTerms(text);
+        String translated = translateLarge(protectedText.text, target.code);
+        out.append(protectedText.restore(translated)).append("\n\n");
+    }
+
+    private static String translateLarge(String text, String targetCode) throws IOException {
+        StringBuilder out = new StringBuilder();
+        for (String chunk : chunks(text, 1400)) {
+            if (out.length() > 0) out.append('\n');
+            out.append(translateChunk(chunk, targetCode));
+        }
+        return out.toString();
+    }
+
+    private static String translateChunk(String text, String targetCode) throws IOException {
+        String query = URLEncoder.encode(text, "UTF-8");
+        String target = URLEncoder.encode(targetCode, "UTF-8");
+        URL url = new URL("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
+                + target + "&dt=t&q=" + query);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(45000);
+        conn.setRequestProperty("User-Agent", "PG-Bug-Mail-Tracker/1.0");
+        int code = conn.getResponseCode();
+        InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+        String body = in == null ? "" : readAll(in);
+        if (code >= 400) throw new IOException("HTTP " + code + "\n" + body);
+        return parseGoogleTranslation(body);
+    }
+
+    private static String parseGoogleTranslation(String json) throws IOException {
+        try {
+            ScriptEngine engine = new ScriptEngineManager().getEngineByName("javascript");
+            if (engine != null) {
+                Object rootObject = engine.eval("Java.asJSONCompatible(" + json + ")");
+                if (rootObject instanceof java.util.List) {
+                    java.util.List root = (java.util.List) rootObject;
+                    if (!root.isEmpty() && root.get(0) instanceof java.util.List) {
+                        java.util.List sentences = (java.util.List) root.get(0);
+                        StringBuilder out = new StringBuilder();
+                        for (Object item : sentences) {
+                            if (item instanceof java.util.List) {
+                                java.util.List sentence = (java.util.List) item;
+                                if (!sentence.isEmpty() && sentence.get(0) != null) out.append(sentence.get(0).toString());
+                            }
+                        }
+                        if (out.length() > 0) return out.toString();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Some Java runtimes remove Nashorn; use the small fallback parser below.
+        }
+
+        String fallback = parseTranslationFallback(json);
+        if (!fallback.isEmpty()) return fallback;
+        throw new IOException("无法解析翻译接口返回内容");
+    }
+
+    private static String parseTranslationFallback(String json) {
+        List<String> strings = new ArrayList<String>();
+        boolean inString = false;
+        boolean escaped = false;
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (!inString) {
+                if (c == '"') {
+                    inString = true;
+                    current.setLength(0);
+                }
+                continue;
+            }
+            if (escaped) {
+                if (c == 'n') current.append('\n');
+                else if (c == 't') current.append('\t');
+                else if (c == 'r') current.append('\r');
+                else if (c == 'u' && i + 4 < json.length()) {
+                    try {
+                        current.append((char) Integer.parseInt(json.substring(i + 1, i + 5), 16));
+                        i += 4;
+                    } catch (NumberFormatException ex) {
+                        current.append("\\u");
+                    }
+                } else {
+                    current.append(c);
+                }
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                strings.add(current.toString());
+                inString = false;
+            } else {
+                current.append(c);
+            }
+        }
+
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i + 1 < strings.size(); i += 2) {
+            out.append(strings.get(i));
+        }
+        return out.toString();
+    }
+
+    private static ProtectedText protectTerms(String text) {
+        Matcher matcher = PROTECTED_TOKEN.matcher(text);
+        StringBuffer buffer = new StringBuffer();
+        List<String> terms = new ArrayList<String>();
+        while (matcher.find()) {
+            String term = matcher.group();
+            String marker = "ZXPGTERM" + terms.size() + "ZX";
+            terms.add(term);
+            matcher.appendReplacement(buffer, Matcher.quoteReplacement(marker));
+        }
+        matcher.appendTail(buffer);
+        return new ProtectedText(buffer.toString(), terms);
+    }
+
+    private static boolean isCodeLikeLine(String line) {
+        String t = line == null ? "" : line.trim();
+        if (t.isEmpty()) return false;
+        if (SQL_START.matcher(t).matches() || LOG_LINE.matcher(t).matches()) return true;
+        if (t.startsWith(">")) return true;
+        if (t.startsWith("$ ") || t.startsWith("# ") || t.startsWith("./") || t.startsWith("/") || t.matches("^[A-Za-z]:\\\\.*")) return true;
+        if (t.matches(".*\\b[a-zA-Z_][a-zA-Z0-9_]*\\(.*\\).*")) return true;
+        if (t.matches(".*(::|:=|=>|->|\\{|\\}|\\[|\\]|;).*")
+                && t.matches(".*\\b(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|ERROR|FATAL|PANIC|NULL|return|if|else|for|while)\\b.*")) {
+            return true;
+        }
+        int codeChars = 0;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if ("{}[]();=<>|/$\\".indexOf(c) >= 0) codeChars++;
+        }
+        return codeChars >= 4 && t.indexOf(' ') < 0;
+    }
+
+    private static List<String> chunks(String text, int max) {
+        List<String> chunks = new ArrayList<String>();
+        String remaining = text == null ? "" : text.trim();
+        while (remaining.length() > max) {
+            int split = bestSplit(remaining, max);
+            chunks.add(remaining.substring(0, split).trim());
+            remaining = remaining.substring(split).trim();
+        }
+        if (!remaining.isEmpty()) chunks.add(remaining);
+        return chunks;
+    }
+
+    private static int bestSplit(String text, int max) {
+        int split = -1;
+        for (String mark : new String[] {"\n\n", ". ", "? ", "! ", "; ", "\n", ", "}) {
+            split = text.lastIndexOf(mark, max);
+            if (split > max / 2) return split + mark.length();
+        }
+        return max;
+    }
+
+    private static String[] normalizeLines(String text) {
+        return (text == null ? "" : text.replace("\r\n", "\n").replace('\r', '\n')).split("\\n", -1);
+    }
+
+    private static String readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int n;
+        try {
+            while ((n = in.read(buffer)) >= 0) out.write(buffer, 0, n);
+        } finally {
+            in.close();
+        }
+        return new String(out.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    private static class ProtectedText {
+        final String text;
+        final List<String> terms;
+
+        ProtectedText(String text, List<String> terms) {
+            this.text = text;
+            this.terms = terms;
+        }
+
+        String restore(String value) {
+            String restored = value == null ? "" : value;
+            for (int i = 0; i < terms.size(); i++) {
+                String marker = "ZXPGTERM" + i + "ZX";
+                restored = restored.replace(marker, terms.get(i));
+                restored = restored.replace(marker.toLowerCase(Locale.ROOT), terms.get(i));
+                restored = restored.replace(marker.replace("ZX", "ZX "), terms.get(i));
+            }
+            return restored;
+        }
     }
 }
 
@@ -608,6 +1523,23 @@ class BugTableModel extends AbstractTableModel {
 
     public List<BugRecord> allRecords() {
         return new ArrayList<BugRecord>(all);
+    }
+
+    public boolean removeRecord(BugRecord record) {
+        boolean removed = all.remove(record);
+        if (!removed) {
+            String recordKey = key(record);
+            Iterator<BugRecord> iterator = all.iterator();
+            while (iterator.hasNext()) {
+                if (key(iterator.next()).equals(recordKey)) {
+                    iterator.remove();
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        if (removed) applyFilter();
+        return removed;
     }
 
     public BugRecord getRecord(int row) { return shown.get(row); }
