@@ -16,24 +16,33 @@
 ## 环境要求
 
 - Windows
-- Java 8 或更高版本（需要 `java` 和 `javac` 可在命令行中使用）
+- Java 8 或更高版本运行环境（需要 `javaw` 可用；普通使用不需要 CMake 或 javac）
 - 可访问 https://www.postgresql.org 的网络连接
 
 ## 启动
 
-首选双击项目根目录的 `PGBugMailTracker.exe`，它会以正常 Windows 图形程序方式启动，不显示 cmd 窗口。
+从 GitHub 下载完整项目并解压后，直接双击项目根目录的 `PGBugMailTracker.exe` 即可使用。它会以正常 Windows 图形程序方式启动，不显示 cmd 窗口。
 
-如果还没有生成 exe，可以使用 CMake 构建，生成文件会在 `cmake-build-debug/bin/PGBugMailTracker.exe`，也可以复制到项目根目录使用。
+不要只单独下载 `PGBugMailTracker.exe` 一个文件；请保留同目录下的 `PGBugMailTracker.jar`、`assets/` 等项目文件。
 
-双击项目根目录的 `run-gui.vbs` 也可以以 GUI 方式启动，不显示 cmd 窗口，适合作为备用入口。
+如果系统没有 Java 运行环境，exe 会提示先安装 Java 8 或更高版本。
 
-也可以双击 `run.bat`，它会在编译后用 `javaw` 启动程序，cmd 窗口只会短暂闪一下。
+`run.bat` 和 `run-gui.vbs` 只是备用启动入口，一般不需要使用。
 
-如果需要查看 Java 控制台输出或编译错误，双击 `run-console.bat`。
+如果需要查看 Java 控制台输出或编译错误，可以双击 `run-console.bat`。
 
-启动脚本会自动编译 `legacy-java/src/PgBugMailTracker.java` 到 `out/`，然后打开桌面程序。
+## 开发和重新构建
 
-也可以在 PowerShell 中手动启动：
+修改 Java 源码后，可以在 PowerShell 中重新编译并打包：
+
+```powershell
+javac -encoding UTF-8 -d out\jar-classes legacy-java\src\PgBugMailTracker.java
+jar cfe PGBugMailTracker.jar PgBugMailTracker -C out\jar-classes .
+```
+
+修改 exe 启动器后，可以使用 CMake 构建，生成文件会在 `cmake-build-debug/bin/PGBugMailTracker.exe`，再复制到项目根目录使用。
+
+也可以不打包 jar，直接从 class 文件运行：
 
 ```powershell
 javac -encoding UTF-8 -d out legacy-java\src\PgBugMailTracker.java
@@ -71,6 +80,7 @@ java -cp out PgBugMailTracker
 ```text
 assets/                     应用和桌面快捷方式图标
 PGBugMailTracker.exe        正常 Windows 图形启动入口
+PGBugMailTracker.jar        已打包的 Java 应用，exe 会优先启动它
 legacy-java/src/PgBugMailTracker.java   Java 桌面程序及抓取、解析、存储逻辑
 native-c/java_launcher.c    正常 Windows exe 启动器，隐藏编译并用 javaw 打开完整 Java 界面
 run.bat                     编译并启动程序
