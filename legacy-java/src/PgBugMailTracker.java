@@ -75,10 +75,14 @@ public class PgBugMailTracker extends JFrame {
             int month = args.length > 2 ? Integer.parseInt(args[2]) : cal.get(Calendar.MONTH) + 1;
             int limit = args.length > 3 ? Integer.parseInt(args[3]) : 2;
             List<BugRecord> records = new PgArchiveClient().fetchMonth(year, month, limit);
+            BugTableModel merged = new BugTableModel();
+            merged.merge(records);
             System.out.println("Fetched: " + records.size());
+            System.out.println("Merged: " + merged.allRecords().size());
             for (BugRecord r : records) {
                 System.out.println("Subject: " + r.subject);
                 System.out.println("Bug ID: " + r.bugId);
+                System.out.println("Thread Key: " + r.threadKey);
                 System.out.println("Date: " + r.date);
                 System.out.println("Version: " + r.pgVersion);
                 System.out.println("Repro:");
@@ -1499,6 +1503,7 @@ class BugRecord {
     boolean checked;
     String bugId = "";
     String messageId = "";
+    String threadKey = "";
     String subject = "";
     String from = "";
     String date = "";
@@ -1535,12 +1540,13 @@ class BugTableModel extends AbstractTableModel {
             String k = key(n);
             BugRecord old = byId.get(k);
             if (old == null) {
-                n.bugId = first(n.bugId, Extractor.extractBugId(n.subject + "\n" + n.rawText));
+                n.bugId = first(n.bugId, Extractor.extractBugIdForRecord(n));
                 all.add(n);
                 byId.put(k, n);
                 changed++;
             } else {
                 old.bugId = first(old.bugId, n.bugId);
+                old.threadKey = first(old.threadKey, n.threadKey);
                 old.subject = preferBugSubject(old.subject, n.subject);
                 old.from = first(n.from, old.from);
                 old.date = first(n.date, old.date);
@@ -1564,9 +1570,22 @@ class BugTableModel extends AbstractTableModel {
     }
 
     private static String key(BugRecord r) {
+        normalizeIdentifiers(r);
         String bugId = r.bugId == null ? "" : r.bugId.trim();
         if (!bugId.isEmpty()) return "bug:" + bugId;
+        String threadKey = r.threadKey == null ? "" : r.threadKey.trim();
+        if (!threadKey.isEmpty()) return "thread:" + threadKey;
         return r.messageId == null || r.messageId.trim().isEmpty() ? "url:" + r.url : "msg:" + r.messageId;
+    }
+
+    private static void normalizeIdentifiers(BugRecord r) {
+        if (r == null) return;
+        if (r.bugId == null || r.bugId.trim().isEmpty()) {
+            r.bugId = Extractor.extractBugIdForRecord(r);
+        }
+        if (r.threadKey == null || r.threadKey.trim().isEmpty()) {
+            r.threadKey = Extractor.threadKey(r);
+        }
     }
 
     private static String first(String a, String b) {
@@ -1687,7 +1706,11 @@ class BugTableModel extends AbstractTableModel {
 
 class PgArchiveClient {
     private static final String BASE = "https://www.postgresql.org";
+    private static final int MAX_THREAD_MESSAGES = 80;
     private static final Pattern LINK = Pattern.compile("<a\\s+[^>]*href=\"([^\"]*/message-id/[^\"]+)\"[^>]*>(.*?)</a>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern THREAD_SELECT = Pattern.compile("<select[^>]*id=\"thread_select\"[^>]*>(.*?)</select>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern THREAD_OPTION = Pattern.compile("<option\\s+[^>]*value=\"([^\"]+)\"[^>]*>(.*?)</option>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private final Set<String> expandedThreads = new HashSet<String>();
 
     public List<BugRecord> fetchMonth(int year, int month, int limit) throws IOException {
         return fetchMonth(year, month, limit, null);
@@ -1731,12 +1754,16 @@ class PgArchiveClient {
     }
 
     private BugRecord fetchMessage(String url, String fallbackSubject) throws IOException {
+        return fetchMessage(url, fallbackSubject, true);
+    }
+
+    private BugRecord fetchMessage(String url, String fallbackSubject, boolean includeThread) throws IOException {
         String html = get(url);
         String text = htmlToText(html);
         BugRecord r = new BugRecord();
         r.url = url;
-        r.subject = first(match(text, "(?m)^#\\s*(.+)$"), fallbackSubject);
-        r.bugId = Extractor.extractBugId(r.subject + "\n" + text);
+        r.subject = first(match(text, "(?m)^Subject:\\s*(.+)$"), first(match(text, "(?m)^#\\s*(.+)$"), fallbackSubject));
+        r.bugId = Extractor.extractBugIdFromMessage(r.subject, text);
         r.from = match(text, "(?m)^From:\\s*(.+)$");
         r.date = match(text, "(?m)^Date:\\s*(.+)$");
         r.messageId = clean(match(text, "(?m)^Message-ID:\\s*(.+)$"));
@@ -1749,14 +1776,141 @@ class PgArchiveClient {
         r.status = "待复现";
         r.createdAt = PgBugMailTrackerHelper.now();
         r.updatedAt = r.createdAt;
+        r.threadKey = Extractor.threadKey(r);
+        if (includeThread) expandThreadMessages(r, html);
         return r;
     }
 
+    private void expandThreadMessages(BugRecord baseRecord, String html) throws IOException {
+        String expandKey = first(baseRecord.threadKey, first(baseRecord.messageId, archiveUrlKey(baseRecord.url)));
+        if (expandKey.isEmpty() || !expandedThreads.add(expandKey)) return;
+
+        List<String> links = threadMessageLinks(html, baseRecord.url);
+        for (String link : links) {
+            try {
+                BugRecord related = fetchMessage(link, baseRecord.subject, false);
+                if (related.threadKey.trim().isEmpty()) related.threadKey = baseRecord.threadKey;
+                mergeThreadRecord(baseRecord, related);
+                Thread.sleep(80L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("线程正文抓取被中断", e);
+            } catch (IOException ignored) {
+                // Individual archive messages can disappear or fail; keep the rest of the thread usable.
+            }
+        }
+    }
+
+    private static List<String> threadMessageLinks(String html, String currentUrl) {
+        LinkedHashMap<String, String> links = new LinkedHashMap<String, String>();
+        Matcher select = THREAD_SELECT.matcher(html);
+        if (!select.find()) return new ArrayList<String>();
+        Matcher matcher = THREAD_OPTION.matcher(select.group(1));
+        while (matcher.find() && links.size() < MAX_THREAD_MESSAGES) {
+            String href = BASE + "/message-id/" + decodeEntities(matcher.group(1)).trim();
+            if (sameArchiveUrl(href, currentUrl)) continue;
+            links.put(archiveUrlKey(href), href);
+        }
+        return new ArrayList<String>(links.values());
+    }
+
+    private static void mergeThreadRecord(BugRecord base, BugRecord incoming) {
+        if (incoming == null) return;
+        if (base.bugId.trim().isEmpty() && base.threadKey.trim().isEmpty()) {
+            base.bugId = incoming.bugId;
+        }
+        base.threadKey = first(base.threadKey, incoming.threadKey);
+        base.subject = preferBugSubject(base.subject, incoming.subject);
+        if (base.from.trim().isEmpty()) base.from = incoming.from;
+        if (!incoming.date.trim().isEmpty() && (base.date.trim().isEmpty() || incoming.date.compareTo(base.date) < 0)) {
+            base.date = incoming.date;
+        }
+        base.messageId = appendUnique(base.messageId, incoming.messageId);
+        base.rawText = appendMailText(base.rawText, incoming);
+        base.pgVersion = first(base.pgVersion, incoming.pgVersion);
+        base.errorInfo = appendUniqueBlock(base.errorInfo, incoming.errorInfo);
+        base.reproCode = appendUniqueBlock(base.reproCode, incoming.reproCode);
+        base.diagnosticSteps = first(base.diagnosticSteps, incoming.diagnosticSteps);
+        base.updatedAt = PgBugMailTrackerHelper.now();
+    }
+
+    private static String appendMailText(String oldText, BugRecord incoming) {
+        String body = incoming.rawText == null ? "" : incoming.rawText.trim();
+        if (body.isEmpty()) return oldText == null ? "" : oldText;
+        if (oldText == null || oldText.trim().isEmpty()) return body;
+        if (oldText.contains(body)) return oldText;
+        String title = incoming.date + " " + incoming.from + " " + incoming.messageId;
+        return oldText + "\n\n----- 关联邮件: " + title.trim() + " -----\n" + body;
+    }
+
+    private static String appendUnique(String oldValue, String newValue) {
+        if (newValue == null || newValue.trim().isEmpty()) return oldValue == null ? "" : oldValue;
+        if (oldValue == null || oldValue.trim().isEmpty()) return newValue;
+        return oldValue.contains(newValue) ? oldValue : oldValue + "\n" + newValue;
+    }
+
+    private static String appendUniqueBlock(String oldValue, String newValue) {
+        if (newValue == null || newValue.trim().isEmpty()) return oldValue == null ? "" : oldValue;
+        if (oldValue == null || oldValue.trim().isEmpty()) return newValue;
+        return oldValue.contains(newValue) ? oldValue : oldValue + "\n\n" + newValue;
+    }
+
+    private static String preferBugSubject(String oldSubject, String newSubject) {
+        if (oldSubject == null || oldSubject.trim().isEmpty()) return first(newSubject, "");
+        if (newSubject == null || newSubject.trim().isEmpty()) return oldSubject;
+        boolean oldReply = oldSubject.toLowerCase(Locale.ROOT).startsWith("re:");
+        boolean newReply = newSubject.toLowerCase(Locale.ROOT).startsWith("re:");
+        return oldReply && !newReply ? newSubject : oldSubject;
+    }
+
+    private static String absoluteMessageUrl(String href) {
+        String value = decodeEntities(href == null ? "" : href.trim());
+        if (value.startsWith("//")) return "https:" + value;
+        if (value.startsWith("http://") || value.startsWith("https://")) return value;
+        if (value.startsWith("/")) return BASE + value;
+        return BASE + "/" + value;
+    }
+
+    private static boolean sameArchiveUrl(String a, String b) {
+        return archiveUrlKey(a).equals(archiveUrlKey(b));
+    }
+
+    private static String archiveUrlKey(String url) {
+        String value = url == null ? "" : url.trim();
+        int hash = value.indexOf('#');
+        if (hash >= 0) value = value.substring(0, hash);
+        int query = value.indexOf('?');
+        if (query >= 0) value = value.substring(0, query);
+        if (value.startsWith(BASE)) value = value.substring(BASE.length());
+        while (value.endsWith("/")) value = value.substring(0, value.length() - 1);
+        return value;
+    }
+
     private String get(String url) throws IOException {
+        IOException last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                return getOnce(url);
+            } catch (IOException e) {
+                last = e;
+                if (attempt == 3) break;
+                try {
+                    Thread.sleep(300L * attempt);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("下载被中断", interrupted);
+                }
+            }
+        }
+        throw last;
+    }
+
+    private String getOnce(String url) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         conn.setConnectTimeout(15000);
         conn.setReadTimeout(30000);
         conn.setRequestProperty("User-Agent", "PG-Bug-Mail-Tracker/1.0");
+        conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
         int code = conn.getResponseCode();
         InputStream in = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
         if (in == null) throw new IOException("HTTP " + code + ": " + url);
@@ -1842,6 +1996,7 @@ interface FetchProgress {
 
 class Extractor {
     private static final Pattern BUG_ID = Pattern.compile("(?i)\\bBUG\\s*#\\s*([0-9]+)\\b");
+    private static final Pattern THREAD_LINE = Pattern.compile("^(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+from\\s+(.+)$", Pattern.CASE_INSENSITIVE);
     private static final Pattern VERSION_FIELD = Pattern.compile("(?im)^PostgreSQL\\s+version:\\s*(.+)$");
     private static final Pattern VERSION_INLINE = Pattern.compile("(?i)\\b(?:PG|PostgreSQL)\\s*([0-9]{1,2}(?:\\.[0-9]+)*(?:\\s*beta\\s*[0-9]+|beta[0-9]+)?)\\b");
     private static final Pattern ERROR_LINE = Pattern.compile("(?im)^.*\\b(ERROR|FATAL|PANIC|SIGSEGV|segmentation fault|assert|crash|server closed the connection|OOM|out of memory|NULL dereference|stack buffer overflow)\\b.*$");
@@ -1853,6 +2008,110 @@ class Extractor {
         if (text == null) return "";
         Matcher m = BUG_ID.matcher(text);
         return m.find() ? "#" + m.group(1) : "";
+    }
+
+    static String extractBugIdForRecord(BugRecord record) {
+        if (record == null) return "";
+        return extractBugIdFromMessage(record.subject, record.rawText);
+    }
+
+    static String extractBugIdFromMessage(String subject, String text) {
+        return extractBugId(first(subject, first(headerValue(text, "Subject"), firstHeading(text))));
+    }
+
+    static String threadKey(BugRecord record) {
+        if (record == null) return "";
+        String bugId = first(record.bugId, extractBugIdForRecord(record));
+        if (!bugId.isEmpty()) return "";
+
+        String subject = normalizeThreadSubject(first(record.subject, headerValue(record.rawText, "Subject")));
+        String root = firstThreadRoot(record.rawText);
+        if (!subject.isEmpty() && !root.isEmpty()) return "subject:" + subject + "|root:" + root;
+        if (!subject.isEmpty()) return "subject:" + subject;
+        if (!root.isEmpty()) return "root:" + root;
+        return "";
+    }
+
+    static String normalizeThreadSubject(String subject) {
+        String s = subject == null ? "" : subject.trim();
+        s = s.replaceAll("(?i)^\\s*(\\[[^\\]]*\\]\\s*)+", "");
+        boolean changed;
+        do {
+            String before = s;
+            s = s.replaceAll("(?i)^\\s*(re|fw|fwd|aw|回复|答复)\\s*[:：]\\s*", "");
+            changed = !before.equals(s);
+        } while (changed);
+        s = s.replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+        return s;
+    }
+
+    private static String firstThreadRoot(String text) {
+        if (text == null || text.trim().isEmpty()) return "";
+        String[] lines = text.replace("\r\n", "\n").replace('\r', '\n').split("\\n", -1);
+        boolean inThread = false;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (isArchiveStop(trimmed)) break;
+            if ("Thread:".equalsIgnoreCase(trimmed)) {
+                inThread = true;
+                continue;
+            }
+            if (!inThread) continue;
+            if (trimmed.isEmpty()) continue;
+            if ("Lists:".equalsIgnoreCase(trimmed) || trimmed.endsWith(":")) break;
+            Matcher matcher = THREAD_LINE.matcher(trimmed);
+            if (matcher.find()) {
+                return clean(matcher.group(1) + " " + matcher.group(2).replace("📎", ""));
+            }
+        }
+        return "";
+    }
+
+    private static String withoutThreadIndex(String text) {
+        if (text == null || text.trim().isEmpty()) return "";
+        String[] lines = text.replace("\r\n", "\n").replace('\r', '\n').split("\\n", -1);
+        StringBuilder out = new StringBuilder();
+        boolean inThread = false;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if ("Thread:".equalsIgnoreCase(trimmed)) {
+                inThread = true;
+                continue;
+            }
+            if (inThread) {
+                if ("Lists:".equalsIgnoreCase(trimmed)) {
+                    inThread = false;
+                    out.append(line).append('\n');
+                }
+                continue;
+            }
+            out.append(line).append('\n');
+        }
+        return out.toString();
+    }
+
+    private static boolean isArchiveStop(String line) {
+        String s = line == null ? "" : line.trim().toLowerCase(Locale.ROOT);
+        return s.equals("browse pgsql-bugs by date")
+                || s.equals("previous message")
+                || s.equals("next message")
+                || s.equals("privacy policy")
+                || s.equals("code of conduct")
+                || s.equals("about postgresql")
+                || s.equals("contact")
+                || s.startsWith("copyright ");
+    }
+
+    private static String headerValue(String text, String label) {
+        if (text == null || text.trim().isEmpty()) return "";
+        Matcher matcher = Pattern.compile("(?im)^" + Pattern.quote(label) + ":\\s*(.+)$").matcher(text);
+        return matcher.find() ? clean(matcher.group(1)) : "";
+    }
+
+    private static String firstHeading(String text) {
+        if (text == null || text.trim().isEmpty()) return "";
+        Matcher matcher = Pattern.compile("(?m)^#\\s*(.+)$").matcher(text);
+        return matcher.find() ? clean(matcher.group(1)) : "";
     }
 
     static String extractVersion(String text) {
@@ -2048,11 +2307,19 @@ class Extractor {
         if (m.find()) return m.group(1).trim();
         return "";
     }
+
+    private static String first(String a, String b) {
+        return a != null && !a.trim().isEmpty() ? a : b;
+    }
+
+    private static String clean(String s) {
+        return s == null ? "" : s.replaceAll("\\s+", " ").trim();
+    }
 }
 
 class RecordStore {
     private static final String[] FIELDS = {
-            "bugId", "messageId", "subject", "from", "date", "url", "pgVersion", "errorInfo", "reproCode",
+            "bugId", "messageId", "threadKey", "subject", "from", "date", "url", "pgVersion", "errorInfo", "reproCode",
             "diagnosticSteps", "status", "severity", "tags", "notes", "rawText", "createdAt", "updatedAt"
     };
     private final File file;
@@ -2072,7 +2339,8 @@ class RecordStore {
                 String[] parts = line.split("\\t", -1);
                 BugRecord r = new BugRecord();
                 for (int i = 0; i < Math.min(parts.length, fields.length); i++) set(r, fields[i], decode(parts[i]));
-                if (r.bugId.trim().isEmpty()) r.bugId = Extractor.extractBugId(r.subject + "\n" + r.rawText);
+                if (r.bugId.trim().isEmpty()) r.bugId = Extractor.extractBugIdForRecord(r);
+                if (r.threadKey.trim().isEmpty()) r.threadKey = Extractor.threadKey(r);
                 if (Extractor.shouldRefreshRepro(r.reproCode)) r.reproCode = Extractor.extractRepro(r.rawText);
                 records.add(r);
             }
@@ -2112,6 +2380,7 @@ class RecordStore {
     private static String get(BugRecord r, String field) {
         if ("bugId".equals(field)) return r.bugId;
         if ("messageId".equals(field)) return r.messageId;
+        if ("threadKey".equals(field)) return r.threadKey;
         if ("subject".equals(field)) return r.subject;
         if ("from".equals(field)) return r.from;
         if ("date".equals(field)) return r.date;
@@ -2133,6 +2402,7 @@ class RecordStore {
     private static void set(BugRecord r, String field, String value) {
         if ("bugId".equals(field)) r.bugId = value;
         else if ("messageId".equals(field)) r.messageId = value;
+        else if ("threadKey".equals(field)) r.threadKey = value;
         else if ("subject".equals(field)) r.subject = value;
         else if ("from".equals(field)) r.from = value;
         else if ("date".equals(field)) r.date = value;
