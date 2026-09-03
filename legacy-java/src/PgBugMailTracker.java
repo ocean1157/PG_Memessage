@@ -187,6 +187,12 @@ public class PgBugMailTracker extends JFrame {
             @Override public void actionPerformed(ActionEvent e) { openSelectedUrl(); }
         });
         bar.add(open, c);
+        JButton refreshBody = new JButton("补全原文");
+        refreshBody.setToolTipText("重新抓取当前记录所在官方线程，补全本地缺失的邮件正文");
+        refreshBody.addActionListener(new ActionListener() {
+            @Override public void actionPerformed(ActionEvent e) { refreshSelectedThread(); }
+        });
+        bar.add(refreshBody, c);
         addLabel(bar, c, "翻译为");
         translationTarget.setToolTipText("源语言自动识别，只翻译自然语言描述，代码和专业标识尽量保留");
         bar.add(translationTarget, c);
@@ -597,6 +603,34 @@ public class PgBugMailTracker extends JFrame {
         }
     }
 
+    private void refreshSelectedThread() {
+        if (selected == null || selected.url.trim().isEmpty()) {
+            statusLabel.setText("请先选择一条带 URL 的邮件记录");
+            return;
+        }
+        final BugRecord target = selected;
+        setBusy("正在补全当前线程原文...");
+        SwingWorker<BugRecord, Void> worker = new SwingWorker<BugRecord, Void>() {
+            @Override protected BugRecord doInBackground() throws Exception {
+                return new PgArchiveClient().fetchThread(target.url, target.subject);
+            }
+
+            @Override protected void done() {
+                try {
+                    BugRecord refreshed = get();
+                    tableModel.merge(Collections.singletonList(refreshed));
+                    store.save(tableModel.allRecords());
+                    showRecord(target);
+                    statusLabel.setText("当前线程原文已补全并保存");
+                } catch (Exception e) {
+                    showError("补全原文失败", e);
+                    statusLabel.setText("补全原文失败");
+                }
+            }
+        };
+        worker.execute();
+    }
+
     private void setBusy(String text) {
         statusLabel.setText(text);
     }
@@ -673,7 +707,7 @@ class ConversationRenderer {
     }
 
     static boolean hasTranslatableBody(BugRecord record) {
-        for (MailMessage message : buildMessages(record)) {
+        for (MailMessage message : visibleMessages(buildMessages(record))) {
             if (message.body != null && !message.body.trim().isEmpty()) return true;
         }
         return false;
@@ -684,7 +718,7 @@ class ConversationRenderer {
     }
 
     static String renderTranslated(BugRecord record, TranslationLanguage target) throws IOException {
-        List<MailMessage> messages = buildMessages(record);
+        List<MailMessage> messages = visibleMessages(buildMessages(record));
         Map<String, String> translations = new HashMap<String, String>();
         for (MailMessage message : messages) {
             String body = compactBody(message.body);
@@ -696,7 +730,8 @@ class ConversationRenderer {
     }
 
     private static String render(BugRecord record, Map<String, String> translations, TranslationLanguage target, String notice) {
-        List<MailMessage> messages = buildMessages(record);
+        List<MailMessage> allMessages = buildMessages(record);
+        List<MailMessage> messages = visibleMessages(allMessages);
         String reporterKey = reporterKey(messages, record);
         String title = cleanOneLine((record.bugId + " " + record.subject).trim());
         if (title.isEmpty()) title = "未命名邮件";
@@ -708,7 +743,7 @@ class ConversationRenderer {
         html.append("<div style='font-size:16px;font-weight:bold;color:#111827;margin-bottom:4px;'>")
                 .append(escape(title)).append("</div>");
         html.append("<div style='color:#667085;margin-bottom:12px;'>");
-        html.append("邮件往返 ").append(messages.size()).append(" 封");
+        html.append("已显示正文 ").append(messages.size()).append(" 封");
         if (!record.status.trim().isEmpty()) html.append(" · 状态 ").append(escape(record.status.trim()));
         if (!record.pgVersion.trim().isEmpty()) html.append(" · PG ").append(escape(record.pgVersion.trim()));
         if (target != null && translations != null) html.append(" · 已嵌入翻译: ").append(escape(target.name));
@@ -732,11 +767,10 @@ class ConversationRenderer {
     }
 
     static String translationSource(BugRecord record) {
-        List<MailMessage> messages = buildMessages(record);
+        List<MailMessage> messages = visibleMessages(buildMessages(record));
         StringBuilder text = new StringBuilder();
         for (MailMessage message : messages) {
             String body = compactBody(message.body);
-            if (body.isEmpty() && message.summaryOnly) continue;
             text.append("Time: ").append(message.date).append('\n');
             text.append("From: ").append(message.from).append('\n');
             if (!message.to.isEmpty()) text.append("To: ").append(message.to).append('\n');
@@ -779,11 +813,7 @@ class ConversationRenderer {
         if (!message.subject.isEmpty()) html.append("<br>主题: ").append(escape(message.subject));
         html.append("</div>");
         if (message.body == null || message.body.trim().isEmpty()) {
-            if (message.summaryOnly) {
-                html.append("<div style='font-size:11px;color:#98a2b3;margin-top:8px;'>正文未抓取，仅显示线程索引信息。</div>");
-            } else {
-                html.append("<div style='font-size:11px;color:#98a2b3;margin-top:8px;'>这封邮件没有可显示的正文。</div>");
-            }
+            html.append("<div style='font-size:11px;color:#98a2b3;margin-top:8px;'>这封邮件没有可显示内容。</div>");
         } else {
             html.append("<div style='font-family:Microsoft YaHei,Segoe UI,Consolas,monospace;font-size:12px;");
             html.append("line-height:1.45;margin-top:8px;color:#1f2937;'>");
@@ -807,7 +837,7 @@ class ConversationRenderer {
     private static String emptyMessage(String rawText) {
         String text = rawText == null || rawText.trim().isEmpty()
                 ? "当前记录没有邮件原文。"
-                : rawText.trim();
+                : "当前记录只有线程目录，尚未保存可显示的邮件内容。请重新抓取对应月份补全文本。";
         return "<table width='100%' cellpadding='10' cellspacing='0' bgcolor='#ffffff' "
                 + "style='border:1px solid #d0d7de;'><tr><td>"
                 + bodyHtml(limit(text, 4000), false)
@@ -849,6 +879,15 @@ class ConversationRenderer {
             }
         });
         return result;
+    }
+
+    private static List<MailMessage> visibleMessages(List<MailMessage> messages) {
+        List<MailMessage> visible = new ArrayList<MailMessage>();
+        for (MailMessage message : messages) {
+            if (message.summaryOnly && compactBody(message.body).isEmpty()) continue;
+            visible.add(message);
+        }
+        return visible;
     }
 
     private static List<MailMessage> parseBodyBlocks(String rawText) {
@@ -1081,7 +1120,7 @@ class ConversationRenderer {
     private static String bodyHtml(String body, boolean summaryOnly) {
         String text = body == null ? "" : body.trim();
         if (text.isEmpty()) {
-            text = summaryOnly ? "这封只在邮件 Thread 索引里出现，本地还没有抓到正文。" : "这封邮件没有可显示的正文。";
+            text = summaryOnly ? "" : "这封邮件没有可显示内容。";
         }
         text = compactBody(text);
         StringBuilder html = new StringBuilder();
@@ -1753,6 +1792,10 @@ class PgArchiveClient {
         return records;
     }
 
+    public BugRecord fetchThread(String url, String fallbackSubject) throws IOException {
+        return fetchMessage(url, fallbackSubject);
+    }
+
     private BugRecord fetchMessage(String url, String fallbackSubject) throws IOException {
         return fetchMessage(url, fallbackSubject, true);
     }
@@ -2339,7 +2382,7 @@ class RecordStore {
                 String[] parts = line.split("\\t", -1);
                 BugRecord r = new BugRecord();
                 for (int i = 0; i < Math.min(parts.length, fields.length); i++) set(r, fields[i], decode(parts[i]));
-                if (r.bugId.trim().isEmpty()) r.bugId = Extractor.extractBugIdForRecord(r);
+                r.bugId = Extractor.extractBugIdForRecord(r);
                 if (r.threadKey.trim().isEmpty()) r.threadKey = Extractor.threadKey(r);
                 if (Extractor.shouldRefreshRepro(r.reproCode)) r.reproCode = Extractor.extractRepro(r.rawText);
                 records.add(r);
