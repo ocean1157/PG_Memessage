@@ -51,7 +51,6 @@ public class PgBugMailTracker extends JFrame {
     private final JTextArea stepsArea = area(7);
     private final JTextArea notesArea = area(5);
     private final JEditorPane conversationPane = conversationPane();
-    private final JTextArea translationArea = readOnlyArea(10);
     private final JTextArea rawArea = readOnlyArea(10);
 
     private BugRecord selected;
@@ -192,6 +191,11 @@ public class PgBugMailTracker extends JFrame {
             @Override public void actionPerformed(ActionEvent e) { translateSelected(); }
         });
         bar.add(translate, c);
+        JButton original = new JButton("显示原文");
+        original.addActionListener(new ActionListener() {
+            @Override public void actionPerformed(ActionEvent e) { showOriginalConversation(); }
+        });
+        bar.add(original, c);
         JButton delete = new JButton("删除记录");
         delete.addActionListener(new ActionListener() {
             @Override public void actionPerformed(ActionEvent e) { deleteSelectedRecord(); }
@@ -218,7 +222,6 @@ public class PgBugMailTracker extends JFrame {
         JPanel panel = new JPanel(new BorderLayout(8, 8));
         detailTabs.addTab("邮件信息", buildFormPanel());
         detailTabs.addTab("对话原文", new JScrollPane(conversationPane));
-        detailTabs.addTab("翻译结果", new JScrollPane(translationArea));
         detailTabs.addTab("纯文本原文", new JScrollPane(rawArea));
         panel.add(detailTabs, BorderLayout.CENTER);
         return panel;
@@ -414,8 +417,6 @@ public class PgBugMailTracker extends JFrame {
         notesArea.setText(r.notes);
         conversationPane.setText(ConversationRenderer.render(r));
         conversationPane.setCaretPosition(0);
-        translationArea.setText("点击顶部“翻译原文”后，这里会显示中文翻译。\n\n代码、SQL、路径、日志、错误码和 PostgreSQL 专业术语会尽量保留原文。");
-        translationArea.setCaretPosition(0);
         rawArea.setText(r.rawText);
         rawArea.setCaretPosition(0);
         loadingRecord = false;
@@ -499,6 +500,17 @@ public class PgBugMailTracker extends JFrame {
         return sb.toString().trim();
     }
 
+    private void showOriginalConversation() {
+        if (selected == null) {
+            statusLabel.setText("请先选择邮件记录");
+            return;
+        }
+        conversationPane.setText(ConversationRenderer.render(selected));
+        conversationPane.setCaretPosition(0);
+        detailTabs.setSelectedIndex(1);
+        statusLabel.setText("已显示对话原文");
+    }
+
     private void translateSelected() {
         if (selected == null) {
             statusLabel.setText("请先选择要翻译的邮件记录");
@@ -506,32 +518,33 @@ public class PgBugMailTracker extends JFrame {
         }
         final BugRecord record = selected;
         final TranslationLanguage target = (TranslationLanguage) translationTarget.getSelectedItem();
-        final String source = ConversationRenderer.translationSource(record);
-        if (source.trim().isEmpty()) {
-            translationArea.setText("当前记录没有可翻译的邮件文本。");
-            detailTabs.setSelectedIndex(2);
+        if (!ConversationRenderer.hasTranslatableBody(record)) {
+            conversationPane.setText(ConversationRenderer.renderTranslationNotice(record, target, "当前记录没有可翻译的邮件正文。"));
+            conversationPane.setCaretPosition(0);
+            detailTabs.setSelectedIndex(1);
             return;
         }
 
-        translationArea.setText("正在翻译为 " + target.name + "，请稍候...\n\n会保留代码、SQL、路径、日志、错误码和 PostgreSQL 专业术语。");
-        translationArea.setCaretPosition(0);
-        detailTabs.setSelectedIndex(2);
+        conversationPane.setText(ConversationRenderer.renderTranslationNotice(record, target,
+                "正在翻译为 " + target.name + "，请稍候。代码、SQL、路径、日志、错误码和 PostgreSQL 专业术语会尽量保留原文。"));
+        conversationPane.setCaretPosition(0);
+        detailTabs.setSelectedIndex(1);
         statusLabel.setText("正在翻译原文为 " + target.name + "...");
 
         SwingWorker<String, Void> worker = new SwingWorker<String, Void>() {
             @Override protected String doInBackground() throws Exception {
-                return ProfessionalTranslator.translate(source, target);
+                return ConversationRenderer.renderTranslated(record, target);
             }
 
             @Override protected void done() {
                 try {
-                    translationArea.setText(get());
-                    translationArea.setCaretPosition(0);
+                    conversationPane.setText(get());
+                    conversationPane.setCaretPosition(0);
                     statusLabel.setText("翻译完成：" + target.name);
                 } catch (Exception e) {
-                    translationArea.setText("翻译失败：\n" + e.getMessage()
-                            + "\n\n建议稍后重试，或检查当前网络是否可以访问在线翻译接口。");
-                    translationArea.setCaretPosition(0);
+                    conversationPane.setText(ConversationRenderer.renderTranslationNotice(record, target,
+                            "翻译失败：" + e.getMessage() + "。建议稍后重试，或检查当前网络是否可以访问在线翻译接口。"));
+                    conversationPane.setCaretPosition(0);
                     statusLabel.setText("翻译失败");
                 }
             }
@@ -557,7 +570,6 @@ public class PgBugMailTracker extends JFrame {
         stepsArea.setText("");
         notesArea.setText("");
         conversationPane.setText(ConversationRenderer.render(new BugRecord()));
-        translationArea.setText("");
         rawArea.setText("");
         loadingRecord = false;
     }
@@ -653,6 +665,33 @@ class ConversationRenderer {
     ));
 
     static String render(BugRecord record) {
+        return render(record, null, null, null);
+    }
+
+    static boolean hasTranslatableBody(BugRecord record) {
+        for (MailMessage message : buildMessages(record)) {
+            if (message.body != null && !message.body.trim().isEmpty()) return true;
+        }
+        return false;
+    }
+
+    static String renderTranslationNotice(BugRecord record, TranslationLanguage target, String notice) {
+        return render(record, null, target, notice);
+    }
+
+    static String renderTranslated(BugRecord record, TranslationLanguage target) throws IOException {
+        List<MailMessage> messages = buildMessages(record);
+        Map<String, String> translations = new HashMap<String, String>();
+        for (MailMessage message : messages) {
+            String body = compactBody(message.body);
+            if (!body.isEmpty()) {
+                translations.put(messageKey(message), ProfessionalTranslator.translateBody(body, target));
+            }
+        }
+        return render(record, translations, target, null);
+    }
+
+    private static String render(BugRecord record, Map<String, String> translations, TranslationLanguage target, String notice) {
         List<MailMessage> messages = buildMessages(record);
         String reporterKey = reporterKey(messages, record);
         String title = cleanOneLine((record.bugId + " " + record.subject).trim());
@@ -668,13 +707,19 @@ class ConversationRenderer {
         html.append("邮件往返 ").append(messages.size()).append(" 封");
         if (!record.status.trim().isEmpty()) html.append(" · 状态 ").append(escape(record.status.trim()));
         if (!record.pgVersion.trim().isEmpty()) html.append(" · PG ").append(escape(record.pgVersion.trim()));
+        if (target != null && translations != null) html.append(" · 已嵌入翻译: ").append(escape(target.name));
         html.append("</div>");
+        if (notice != null && !notice.trim().isEmpty()) {
+            html.append("<table width='100%' cellpadding='8' cellspacing='0' bgcolor='#fff7cc' ")
+                    .append("style='border:1px solid #e3b341;margin-bottom:12px;'><tr><td>")
+                    .append(escape(notice)).append("</td></tr></table>");
+        }
 
         if (messages.isEmpty()) {
             html.append(emptyMessage(record.rawText));
         } else {
             for (MailMessage message : messages) {
-                appendBubble(html, message, reporterKey);
+                appendBubble(html, message, reporterKey, translations);
             }
         }
 
@@ -703,7 +748,7 @@ class ConversationRenderer {
         return text.toString().trim();
     }
 
-    private static void appendBubble(StringBuilder html, MailMessage message, String reporterKey) {
+    private static void appendBubble(StringBuilder html, MailMessage message, String reporterKey, Map<String, String> translations) {
         String identity = identity(message.from);
         boolean reporterSide = !reporterKey.isEmpty() && reporterKey.equals(identity);
         if (message.from.toLowerCase(Locale.ROOT).contains("pg bug reporting form")) reporterSide = true;
@@ -738,7 +783,17 @@ class ConversationRenderer {
         } else {
             html.append("<div style='font-family:Microsoft YaHei,Segoe UI,Consolas,monospace;font-size:12px;");
             html.append("line-height:1.45;margin-top:8px;color:#1f2937;'>");
-            html.append(bodyHtml(message.body, false));
+            String translated = translations == null ? "" : translations.get(messageKey(message));
+            if (translated != null && !translated.trim().isEmpty()) {
+                html.append("<div style='font-size:11px;font-weight:bold;color:#175cd3;margin-bottom:4px;'>译文</div>");
+                html.append(bodyHtml(translated, false));
+                html.append("<div style='border-top:1px solid #cbd5e1;margin-top:8px;padding-top:8px;color:#667085;'>");
+                html.append("<div style='font-size:11px;font-weight:bold;margin-bottom:4px;'>原文</div>");
+                html.append(bodyHtml(message.body, false));
+                html.append("</div>");
+            } else {
+                html.append(bodyHtml(message.body, false));
+            }
             html.append("</div>");
         }
         html.append("</td></tr></table>");
@@ -1076,6 +1131,10 @@ class ConversationRenderer {
         return "msg:" + message.messageId;
     }
 
+    private static String messageKey(MailMessage message) {
+        return looseKey(message);
+    }
+
     private static String identity(String sender) {
         String email = email(sender).toLowerCase(Locale.ROOT);
         if (!email.isEmpty()) return email;
@@ -1209,7 +1268,13 @@ class ProfessionalTranslator {
         StringBuilder out = new StringBuilder();
         out.append("目标语言: ").append(target.name).append('\n');
         out.append("说明: SQL、代码、路径、日志、错误码、函数名和 PostgreSQL 专业术语会尽量保留原文。\n\n");
+        out.append(translateBody(source, target));
+        return out.toString().replaceAll("\\n{4,}", "\n\n\n").trim();
+    }
 
+    static String translateBody(String source, TranslationLanguage target) throws IOException {
+        if (target == null) target = languages()[0];
+        StringBuilder out = new StringBuilder();
         String[] lines = normalizeLines(source);
         StringBuilder paragraph = new StringBuilder();
         for (String line : lines) {
